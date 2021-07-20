@@ -16,10 +16,12 @@
 	#endif
 #endif
 
-#include <stdio.h>
+#include <array>
 #include <chrono>
-#include <optional>
 #include <cstring>
+#include <optional>
+#include <stdio.h>
+#include <tuple>
 
 #define VERSION_NAME "TermMarkV1"
 
@@ -28,8 +30,8 @@
 #define VT_SYNC_BEGIN "\033P=1s\033\\"
 #define VT_SYNC_END   "\033P=2s\033\\"
 #else
-#define VT_SYNC_BEGIN "\033[?2026h"
-#define VT_SYNC_END   "\033[?2026l"
+#define VT_SYNC_BEGIN "\033[?2026h" "\033P=1s\033\\"
+#define VT_SYNC_END   "\033[?2026l" "\033P=2s\033\\"
 #endif
 
 #define ArrayCount(Array) (sizeof(Array) / sizeof((Array)[0]))
@@ -41,6 +43,9 @@ struct buffer
     char *Data;
 };
 
+using std::array;
+using std::tie;
+using std::tuple;
 
 enum class UserAction
 {
@@ -145,13 +150,15 @@ public:
 	virtual TerminalSize terminalSize() const = 0;
 };
 
+using StatResult = tuple<int, int, int, int>;
+
 class perf_stat
 {
 public:
 	virtual ~perf_stat() = default;
 
 	virtual void begin_frame() = 0;
-	virtual void end_frame(unsigned _nextBytecount, unsigned long long _markAccum) = 0;
+	virtual StatResult end_frame(unsigned _nextBytecount, unsigned long long _markAccum) = 0;
 
 	virtual void reset()
 	{
@@ -215,7 +222,7 @@ class win_perf_stat: public perf_stat
                 AverageMark = A;
                 TermMarkAccum = 0;
             }
-            
+
             StatPercent = (int)(100*AvgMS / StatMS);
         }
 	}
@@ -225,7 +232,7 @@ class win_perf_stat: public perf_stat
 		perf_stat::reset();
 	}
 
-	void end_frame(unsigned _nextByteCount, unsigned long long _markAccum) override
+	StatResult end_frame(unsigned _nextByteCount, unsigned long long _markAccum) override
 	{
 		ByteCount = _nextByteCount;
         PrepMS = GetMS(A.QuadPart, B.QuadPart, Freq.QuadPart);
@@ -233,6 +240,7 @@ class win_perf_stat: public perf_stat
         ReadMS = GetMS(C.QuadPart, D.QuadPart, Freq.QuadPart);
         TotalMS = GetMS(A.QuadPart, D.QuadPart, Freq.QuadPart);
 		TermMarkAccum += _markAccum;
+        return {PrepMS, WriteMS, ReadMS, TotalMS};
 	}
 
 	win_perf_stat()
@@ -350,10 +358,10 @@ extern "C" void mainCRTStartup(void)
     {
         __cpuid((int *)(CPU + 16*SegmentIndex), 0x80000002 + SegmentIndex);
     }
-    
+
 	WinTerminalIO io{};
 	win_perf_stat perf{};
-    
+
 	run(io, perf);
 }
 using large_integer_t = LARGE_INTEGER;
@@ -455,36 +463,57 @@ public:
 
 		return UserAction::Idle;
 	}
-}; 
+};
 UnixTerminalIO* UnixTerminalIO::singleton_ = 0;
 // }}}
+
+using std::chrono::milliseconds;
+using std::chrono::duration_cast;
+using std::chrono::seconds;
+using std::chrono::steady_clock;
 
 class unix_perf_stat: public perf_stat // {{{
 {
 public:
+    steady_clock::time_point A;
+    std::chrono::milliseconds B, C, D;
+
 	void begin_frame() override
 	{
-		// TODO
-	}
-
-	void reset() override
-	{
+        A = steady_clock::now();
 	}
 
 	void tick_prep() override
 	{
+        B = duration_cast<milliseconds>(steady_clock::now() - A);
 	}
 
 	void tick_write() override
 	{
+        C = duration_cast<milliseconds>(steady_clock::now() - A) - B;
 	}
 
 	void tick_read() override
 	{
+        D = duration_cast<milliseconds>(steady_clock::now() - A) - C;
 	}
 
-	void end_frame(unsigned _nextBytecount, unsigned long long _markAccum) override
+	StatResult end_frame(unsigned _nextBytecount, unsigned long long _markAccum) override
 	{
+        return {
+            B.count(),
+            C.count(),
+            D.count(),
+            duration_cast<milliseconds>(steady_clock::now() - A).count()
+        };
+	}
+
+	void reset() override
+	{
+        A = steady_clock::now();
+        B = {};
+        C = {};
+        D = {};
 	}
 }; // }}}
 
@@ -521,9 +550,20 @@ void run(TerminalIO& _io, perf_stat& _perf)
 
     int ByteCount = 0;
 
+    std::array<unsigned, 3> freqs{};
+    auto lastFreqIndex = duration_cast<seconds>(steady_clock::now().time_since_epoch()).count() % freqs.size();
+
     while (Running)
     {
 		_perf.begin_frame();
+
+        auto const freqIndex = duration_cast<seconds>(steady_clock::now().time_since_epoch()).count() % freqs.size();
+        if (freqIndex != lastFreqIndex)
+        {
+            freqs[freqIndex] = 0;
+            lastFreqIndex = freqIndex;
+        }
+        freqs[freqIndex]++;
 
         buffer Frame = {sizeof(TerminalBuffer), 0, TerminalBuffer};
 
@@ -570,9 +610,20 @@ void run(TerminalIO& _io, perf_stat& _perf)
         AppendStat(&Frame, "Frame", FrameIndex);
 
         if(!WritePerLine) AppendStat(&Frame, "Prep", PrepMS, "ms");
-        AppendStat(&Frame, "Write", WriteMS, "ms");
-        AppendStat(&Frame, "Read", ReadMS, "ms");
-        AppendStat(&Frame, "Total", TotalMS, "ms");
+        AppendStat(&Frame, "W", WriteMS, "ms");
+        AppendStat(&Frame, "R", ReadMS, "ms");
+        AppendStat(&Frame, "T", TotalMS, "ms");
+
+        AppendStat(&Frame, "Fi", freqIndex, "");
+        // AppendStat(&Frame, "F1", freqs[0], "");
+        // AppendStat(&Frame, "F2", freqs[1], "");
+        // AppendStat(&Frame, "F3", freqs[2], "");
+        unsigned long fps = 0;
+        for (size_t i = 0; i < freqs.size(); ++i)
+            if (freqIndex != i)
+                fps += freqs[i];
+        fps /= freqs.size() - 1;
+        AppendStat(&Frame, "F", fps, "");
 
         AppendGoto(&Frame, 1, 2);
         AppendString(&Frame, WritePerLine ? "[F1]:write per line " : "[F1]:write per frame ");
@@ -637,7 +688,9 @@ void run(TerminalIO& _io, perf_stat& _perf)
 
 		_perf.tick_read();
 
-		_perf.end_frame(NextByteCount, terminalSize.lines * terminalSize.columns);
+        tie(PrepMS, WriteMS, ReadMS, TotalMS) = _perf.end_frame(NextByteCount, terminalSize.lines * terminalSize.columns);
+
+
         ByteCount = NextByteCount;
         ++FrameIndex;
 

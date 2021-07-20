@@ -1,8 +1,9 @@
+CXXFLAGS := -O
 
 all: termbench
 
 termbench: termbench.cpp
-	g++ -o $@ $^ -std=c++17 -Wall -O $(CXXFLAGS)
+	g++ -o $@ $^ -std=c++17 -Wall $(CXXFLAGS)
 
 clean:
 	rm termbench
